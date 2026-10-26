@@ -2,10 +2,8 @@
 """抖音去广告 mitmproxy addon —— 网络层过滤广告条目"""
 import json, time, os
 
-# 日志写在脚本同目录，跟着脚本走（便携）
-_HERE = os.path.dirname(os.path.abspath(__file__))
-LOG = os.path.join(_HERE, 'filter.log')
-DUMP = os.path.join(_HERE, 'dump.log')
+LOG = r'F:\dsh-work-big\douyin-proxy\filter.log'
+DUMP = r'F:\dsh-work-big\douyin-proxy\dump.log'
 
 
 def _log(msg):
@@ -69,6 +67,42 @@ def deep_ad_reason(it):
     return hits
 
 
+# ---- 直播相关：直接放行，不走代理（直播流延迟敏感，代理会拖断）----
+LIVE_HOSTS = (
+    'live.douyin.com',
+    'bytelink',              # bytelink100-ws.douyin.com 等
+    'bytelink-ws.douyin.com',
+    'douyincdn.com',         # pull-flv / hls CDN
+    'pull-flv',
+    'pull-hls',
+    'webcast',
+    'douyinpic.com/live',
+    'vcs.zijieapi.com',
+    'rtc.douyin.com',
+)
+
+LIVE_PATH_HINTS = (
+    '/webcast/',
+    'bytelink',
+    '/pull-',
+    '.flv',
+    '.m3u8',
+    '/live/',
+)
+
+
+def _is_live(url: str) -> bool:
+    """判断是否直播相关请求"""
+    u = url.lower()
+    for h in LIVE_HOSTS:
+        if h in u:
+            return True
+    for hint in LIVE_PATH_HINTS:
+        if hint in u:
+            return True
+    return False
+
+
 TARGETS = (
     '/aweme/v1/web/tab/feed/',
     '/aweme/v1/web/feed/',
@@ -86,6 +120,9 @@ class AdFilter:
 
     def response(self, flow):
         url = flow.request.pretty_url
+        # 直播相关一律放行（不处理，让代理透传）
+        if _is_live(url):
+            return
         if not any(t in url for t in TARGETS):
             return
         try:
@@ -132,4 +169,29 @@ class AdFilter:
             _log(f'pass {before} items (no ad)  <- {url[:60]}')
 
 
-addons = [AdFilter()]
+
+
+# ---- 直播 WebSocket 长连接：不拦截，直接隧道透传 ----
+def _should_bypass(flow_url: str) -> bool:
+    return _is_live(flow_url)
+
+
+class LiveBypass:
+    """对直播 WebSocket 请求不做 TLS 解密，直接隧道透传"""
+
+    def http_connect(self, flow):
+        host = flow.request.host or ''
+        if any(h in host.lower() for h in LIVE_HOSTS):
+            flow.request.ignore_hosts = True
+
+    def tls_clienthello(self, data):
+        sni = ''
+        try:
+            sni = data.client_hello.sni or ''
+        except Exception:
+            pass
+        if sni and any(h in sni.lower() for h in LIVE_HOSTS):
+            data.ignore_connection = True
+
+
+addons = [AdFilter(), LiveBypass()]
