@@ -1,0 +1,15 @@
+# 便携版运行时（不入库，走 Release 附件）
+python/
+*.zip
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 本地配置
+config.txt
+filter.log
+dump.log
+*.flows
