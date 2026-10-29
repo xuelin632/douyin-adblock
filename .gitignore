@@ -13,3 +13,7 @@ config.txt
 filter.log
 dump.log
 *.flows
+
+# Build output and runtime state
+dist/
+mitm.pid

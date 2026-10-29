@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -31,6 +31,8 @@ class DouyinLauncher
     static string RootDir;
     static string PythonDir;
     static string MitmExe;
+    static string MitmArgsPrefix = "";
+    static string PidFile;
     static string AddonPath;
     static string DouyinExe;
     static string ConfigPath;
@@ -152,8 +154,35 @@ class DouyinLauncher
         catch { }
     }
 
+    static bool MitmAlive()
+    {
+        try
+        {
+            if (!File.Exists(PidFile)) return false;
+            int pid;
+            if (!int.TryParse(File.ReadAllText(PidFile).Trim(), out pid)) return false;
+            Process.GetProcessById(pid);
+            return true;
+        }
+        catch { return false; }
+    }
+
     static void KillMitm()
     {
+        // 先杀我们自己启动的那个（可能是 python.exe）
+        try
+        {
+            if (File.Exists(PidFile))
+            {
+                int pid;
+                if (int.TryParse(File.ReadAllText(PidFile).Trim(), out pid))
+                {
+                    try { Process.GetProcessById(pid).Kill(); } catch { }
+                }
+                try { File.Delete(PidFile); } catch { }
+            }
+        }
+        catch { }
         foreach (Process p in Process.GetProcessesByName("mitmdump"))
         { try { p.Kill(); } catch { } }
     }
@@ -182,6 +211,72 @@ class DouyinLauncher
         return true;
     }
 
+    // 按优先级找 mitmdump.exe
+    static string FindMitm()
+    {
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        // 优先：本目录 python + run_mitmdump.py（不依赖 mitmdump.exe 的 shebang）
+        string wrapper = Path.Combine(RootDir, "run_mitmdump.py");
+        if (File.Exists(wrapper))
+        {
+            string py = Path.Combine(RootDir, "python", "python.exe");
+            if (File.Exists(py))
+            {
+                MitmArgsPrefix = "\"" + wrapper + "\" ";
+                return py;
+            }
+        }
+
+        var cands = new System.Collections.Generic.List<string>();
+
+        // 1) 同目录下的便携版
+        cands.Add(Path.Combine(RootDir, "python", "Scripts", "mitmdump.exe"));
+
+        // 2) 旁边的便携包
+        cands.Add(Path.Combine(new DirectoryInfo(RootDir).Parent.FullName,
+            "抖音去广告便携版", "python", "Scripts", "mitmdump.exe"));
+
+        // 3) DSH 运行时的各版本（自动枚举，抗更新）
+        string rt = Path.Combine(home, ".dsh", "dsh-runtimes");
+        try
+        {
+            if (Directory.Exists(rt))
+            {
+                foreach (string d in Directory.GetDirectories(rt))
+                {
+                    string c = Path.Combine(d, "dependencies", "python", "Scripts", "mitmdump.exe");
+                    if (File.Exists(c)) cands.Insert(0, c);   // 活的最好，放最前
+                }
+            }
+        }
+        catch { }
+
+        // 4) 常见安装位置兜底
+        cands.Add(Path.Combine(home, "AppData", "Local", "Programs", "Python", "Scripts", "mitmdump.exe"));
+        cands.Add(@"C:\Python312\Scripts\mitmdump.exe");
+        cands.Add(@"C:\Python311\Scripts\mitmdump.exe");
+
+        foreach (string c in cands)
+        {
+            try { if (File.Exists(c)) return c; } catch { }
+        }
+
+        // 5) PATH 里找
+        try
+        {
+            foreach (string p in Environment.GetEnvironmentVariable("PATH").Split(';'))
+            {
+                if (string.IsNullOrWhiteSpace(p)) continue;
+                string c = Path.Combine(p.Trim(), "mitmdump.exe");
+                if (File.Exists(c)) return c;
+            }
+        }
+        catch { }
+
+        return cands.Count > 0 ? cands[0] : "";
+    }
+
     static void Main()
     {
         Console.Title = "抖音去广告";
@@ -189,8 +284,9 @@ class DouyinLauncher
         {
             RootDir = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName);
             PythonDir = Path.Combine(RootDir, "python");
-            MitmExe = Path.Combine(PythonDir, "Scripts", "mitmdump.exe");
+            MitmExe = FindMitm();
             AddonPath = Path.Combine(RootDir, "ad_filter.py");
+            PidFile = Path.Combine(RootDir, "mitm.pid");
             ConfigPath = Path.Combine(RootDir, "config.txt");
 
             Console.WriteLine("========================================");
@@ -225,16 +321,17 @@ class DouyinLauncher
             Console.WriteLine("抖音位置: " + DouyinExe);
 
             Console.Write("[1/3] 启动代理组件 ... ");
-            if (Running("mitmdump")) Console.WriteLine("已在运行");
+            if (Running("mitmdump") || MitmAlive()) Console.WriteLine("已在运行");
             else
             {
                 ProcessStartInfo psi = new ProcessStartInfo(MitmExe,
-                    "--listen-port 8080 -s \"" + AddonPath + "\"");
+                    MitmArgsPrefix + "--listen-port 8080 -s \"" + AddonPath + "\"");
                 psi.WorkingDirectory = RootDir;
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
-                Process.Start(psi);
+                Process mp = Process.Start(psi);
+                try { File.WriteAllText(PidFile, mp.Id.ToString()); } catch { }
                 Thread.Sleep(2000);
                 Console.WriteLine("完成");
             }
