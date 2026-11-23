@@ -20,7 +20,7 @@ def archive(folder, destination):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--python-dir', type=Path, default=Path(sys.prefix))
-    parser.add_argument('--version', default='1.0.1')
+    parser.add_argument('--version', default='1.1.0')
     parser.add_argument('--output', type=Path, default=ROOT / 'dist')
     args = parser.parse_args()
     runtime = args.python_dir.resolve()
@@ -44,7 +44,7 @@ def main():
                          ('README-便携版.txt', '使用说明.txt')]:
         shutil.copy2(ROOT / 'build' / source, package / dest)
     shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
-    subprocess.run([str(csc), '/nologo', '/target:exe', '/codepage:65001',
+    subprocess.run([str(csc), '/nologo', '/optimize+', '/target:exe', '/codepage:65001',
                     '/out:' + str(package / '抖音去广告启动器.exe'), str(ROOT / 'src/DouyinLauncher.cs')], check=True)
     subprocess.run([str(package / 'python/python.exe'), '-B', str(package / 'run_mitmdump.py'), '--version'], check=True)
     full = output / ('douyin-adblock-portable-v' + args.version + '.zip')
@@ -53,7 +53,13 @@ def main():
     patch = output / ('douyin-adblock-update-v' + args.version + '.zip')
     with zipfile.ZipFile(patch, 'w', zipfile.ZIP_DEFLATED) as z:
         z.write(ROOT / 'src/ad_filter.py', 'ad_filter.py')
-        z.writestr('UPDATE.txt', 'Close Douyin and its launcher. Copy ad_filter.py beside the old launcher, replacing the existing file. Restart using the old launcher. No runtime or certificate reinstall is needed. First-time users need the full portable package.')
+        z.write(ROOT / 'src/DouyinLauncher.cs', 'DouyinLauncher.cs')
+        z.write(package / '抖音去广告启动器.exe', '抖音去广告启动器.exe')
+        z.writestr(
+            'UPDATE.txt',
+            '完全退出抖音和旧版启动器后，将本压缩包中的 ad_filter.py、DouyinLauncher.cs 和 抖音去广告启动器.exe 覆盖到旧版所在文件夹即可。\n'
+            '无需重新安装 Python 运行环境或证书。首次使用请下载完整便携包。\n'
+        )
     checksums = output / 'SHA256SUMS.txt'
     checksums.write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n' for p in (full, patch)), encoding='ascii')
     for p in (full, patch, checksums):

@@ -1,17 +1,50 @@
 # -*- coding: utf-8 -*-
-"""抖音去广告 mitmproxy addon —— 网络层过滤广告条目"""
-import json, time, os
+"""抖音去广告 mitmproxy addon —— TLS 白名单精准解密 + 信息流广告过滤"""
+import json
+import os
+import time
+from urllib.parse import urlparse
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(_HERE, 'filter.log')
+LOG_OLD = os.path.join(_HERE, 'filter.log.old')
+MAX_LOG_BYTES = 1024 * 1024  # 1 MB 自动轮转
+_log_write_count = 0
+
+
+def _rotate_log_if_needed():
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) >= MAX_LOG_BYTES:
+            os.replace(LOG, LOG_OLD)
+    except Exception:
+        pass
 
 
 def _log(msg):
+    global _log_write_count
     try:
+        _log_write_count += 1
+        if _log_write_count == 1 or _log_write_count % 50 == 0:
+            _rotate_log_if_needed()
         with open(LOG, 'a', encoding='utf-8') as f:
-            f.write(f'{time.strftime("%H:%M:%S")} {msg}\n')
+            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {msg}\n')
     except Exception:
         pass
+
+
+# ---- TLS 解密白名单 ----
+# 仅解密真正下发抖音信息流 JSON 的域名；
+# 其余所有域名（直播流、视频 CDN、浏览器及其他客户端）直接 TLS 隧道透传，
+# 避免无谓解密开销与证书固定（SSL Pinning）冲突。
+DECRYPT_HOSTS = frozenset((
+    'www.douyin.com',
+))
+
+
+def _should_decrypt_host(host):
+    if not host:
+        return False
+    return host.strip().lower().rstrip('.') in DECRYPT_HOSTS
 
 
 # ---- 广告判定 ----
@@ -36,51 +69,7 @@ def is_ad_item(it):
     return False
 
 
-# ---- 直播放行 ----
-LIVE_HOSTS = (
-    'live.douyin.com',
-    'bytelink',
-    'bytelink-ws.douyin.com',
-    'douyincdn.com',
-    'pull-flv',
-    'pull-hls',
-    'webcast',
-    'vcs.zijieapi.com',
-    'rtc.douyin.com',
-)
-
-LIVE_PATH_HINTS = (
-    '/webcast/',
-    'bytelink',
-    '/pull-',
-    '.flv',
-    '.m3u8',
-    '/live/',
-)
-
-
-from urllib.parse import urlparse
-
-
-def _is_live(url):
-    """只判断 host 和 path，绝不匹配 query（query 里有超长签名，会误伤）"""
-    if not url:
-        return False
-    try:
-        u = urlparse(url if '://' in url else '//' + url)
-        host = (u.hostname or '').lower()
-        path = (u.path or '').lower()
-    except Exception:
-        return False
-    for h in LIVE_HOSTS:
-        if h in host:
-            return True
-    for hint in LIVE_PATH_HINTS:
-        if hint in path:
-            return True
-    return False
-
-
+# 需要检查并过滤广告的信息流接口路径
 TARGETS = (
     '/aweme/v1/web/tab/feed/',
     '/aweme/v1/web/feed/',
@@ -90,18 +79,40 @@ TARGETS = (
 )
 
 
+def _is_target_path(path):
+    if not path:
+        return False
+    p = path.lower()
+    return any(t in p for t in TARGETS)
+
+
 class AdFilter:
     def response(self, flow):
         url = flow.request.pretty_url
-        if _is_live(url):
-            return
-        if not any(t in url for t in TARGETS):
-            return
         try:
-            resp = flow.response
-            if not resp or not resp.content:
-                return
-            d = json.loads(resp.content.decode('utf-8'))
+            u = urlparse(url)
+            host = (u.hostname or '').lower()
+            path = (u.path or '').lower()
+        except Exception:
+            return
+
+        if not _should_decrypt_host(host) or not _is_target_path(path):
+            return
+
+        resp = flow.response
+        if not resp or resp.status_code != 200:
+            return
+
+        content_type = resp.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+        if content_type and 'json' not in content_type and content_type != 'text/plain':
+            return
+
+        raw = resp.content
+        if not raw or not raw.strip():
+            return
+
+        try:
+            d = json.loads(raw.decode('utf-8'))
         except Exception as ex:
             _log(f'parse fail {url[:60]}: {ex}')
             return
@@ -119,41 +130,36 @@ class AdFilter:
             # mitmproxy 会按原 Content-Encoding 重新编码，并自动更新 Content-Length。
             # 保留这两个响应头，避免客户端把压缩数据当成普通 JSON。
             resp.content = body
-            _log(f'REMOVED {removed}/{before} ads  <- {url[:80]}')
+            note = ' [all filtered]' if len(kept) == 0 else ''
+            _log(f'REMOVED {removed}/{before} ads{note}  <- {url[:80]}')
         else:
             _log(f'pass {before} items (no ad)  <- {url[:60]}')
 
 
-# ---- 直播 WebSocket / 长连接：不做 TLS 解密，直接隧道透传 ----
-class LiveBypass:
-    """已知直播主机跳过 TLS 解密，其余直播和媒体响应即时转发。"""
-
-    def responseheaders(self, flow):
-        if flow.response is None:
-            return
-        path = urlparse(flow.request.pretty_url).path.lower()
-        # 推荐列表必须完整接收，才能继续过滤广告。
-        if any(t in path for t in TARGETS):
-            return
-        content_type = flow.response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
-        if (_is_live(flow.request.pretty_url)
-                or content_type.startswith(('video/', 'audio/'))
-                or content_type in ('application/x-flv', 'application/vnd.apple.mpegurl',
-                                    'application/x-mpegurl', 'application/dash+xml',
-                                    'text/event-stream')):
-            # response() 才放行已经太晚；长直播流可能一直等不到响应结束。
-            flow.response.stream = True
+class SelectiveDecrypt:
+    """白名单之外的 TLS 连接直接透传；白名单内的非目标响应即时流式转发。"""
 
     def tls_clienthello(self, data):
         try:
             sni = data.client_hello.sni or ''
-            # 无 SNI 时，常规代理仍可从 CONNECT 的目标取得主机名。
             address = data.context.server.address
             host = sni or (address[0] if address else '')
-            if _is_live(host):
+            if not _should_decrypt_host(host):
                 data.ignore_connection = True
         except Exception:
-            pass
+            # 出错时保守透传，不阻断正常连接
+            data.ignore_connection = True
+
+    def responseheaders(self, flow):
+        if flow.response is None:
+            return
+        try:
+            path = urlparse(flow.request.pretty_url).path.lower()
+        except Exception:
+            return
+        # 仅信息流目标接口需要完整缓冲后改写 JSON，其余响应一律流式即时转发。
+        if not _is_target_path(path):
+            flow.response.stream = True
 
 
-addons = [AdFilter(), LiveBypass()]
+addons = [AdFilter(), SelectiveDecrypt()]

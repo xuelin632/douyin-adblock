@@ -19,45 +19,54 @@ WORK = Path(scratch.name)
 addon = types.ModuleType('tested_addon')
 addon.__file__ = str(ROOT / 'ad_filter.py')
 exec(compile((ROOT / 'ad_filter.py').read_bytes(), addon.__file__, 'exec'), addon.__dict__)
-addon._log = lambda message: None
+logs = []
+addon._log = lambda message: logs.append(message)
 passed = 0
 
-def flow(url, content_type='application/json'):
+
+def flow(url, content_type='application/json', status=200, body=b''):
     return types.SimpleNamespace(
         request=mitm_http.Request.make('GET', url),
-        response=mitm_http.Response.make(200, b'', {'content-type': content_type}))
+        response=mitm_http.Response.make(status, body, {'content-type': content_type}))
 
+
+# 1. responseheaders：仅目标信息流接口完整缓冲，其余响应全部即时流式转发
 for url, mime, expected in [
     ('https://unknown.example/live/test', 'application/octet-stream', True),
     ('https://unknown.example/player', 'video/x-flv', True),
     ('https://unknown.example/player', 'Application/X-FLV; charset=binary', True),
     ('https://unknown.example/player', 'application/vnd.apple.mpegurl', True),
     ('https://unknown.example/player', 'text/event-stream', True),
-    ('https://unknown.example/api', 'application/json', False),
+    ('https://www.douyin.com/static/app.js', 'application/javascript', True),
     ('https://www.douyin.com/aweme/v1/web/tab/feed/', 'video/x-flv', False),
     ('https://www.douyin.com/aweme/v1/web/tab/feed/?signature=/live/', 'application/json', False),
 ]:
     f = flow(url, mime)
-    addon.LiveBypass().responseheaders(f)
-    assert f.response.stream is expected, (url, mime)
+    addon.SelectiveDecrypt().responseheaders(f)
+    assert f.response.stream is expected, (url, mime, f.response.stream)
     passed += 1
 
+# 2. tls_clienthello：白名单模式，仅解密 www.douyin.com，其他域名全部直接隧道透传
 for sni, connect_host, expected in [
     ('live.douyin.com', '127.0.0.1', True),
     ('pull-flv-l1.douyincdn.com', '127.0.0.1', True),
     ('webcast3-ws-web-lq.douyin.com', '127.0.0.1', True),
+    ('v26-weba.douyinvod.com', '127.0.0.1', True),
+    ('google.com', 'google.com', True),
     ('', 'live.douyin.com', True),
     ('www.douyin.com', 'www.douyin.com', False),
+    ('WWW.DOUYIN.COM.', '127.0.0.1', False),
     ('', 'www.douyin.com', False),
 ]:
     data = types.SimpleNamespace(
         client_hello=types.SimpleNamespace(sni=sni),
         context=types.SimpleNamespace(server=types.SimpleNamespace(address=(connect_host, 443))),
         ignore_connection=False)
-    addon.LiveBypass().tls_clienthello(data)
-    assert data.ignore_connection is expected, (sni, connect_host)
+    addon.SelectiveDecrypt().tls_clienthello(data)
+    assert data.ignore_connection is expected, (sni, connect_host, data.ignore_connection)
     passed += 1
 
+# 3. 压缩编码、chunked 与广告过滤完整性检查
 for enc in ('identity', 'gzip', 'br', 'zstd'):
     for ad in (False, True):
         for chunked in (False, True):
@@ -68,7 +77,7 @@ for enc in ('identity', 'gzip', 'br', 'zstd'):
                 f.response.headers.pop('content-length', None)
             items = [{'aweme_id': 'normal'}, {'aweme_id': 'other', 'is_ads': ad}]
             f.response.content = json.dumps({'aweme_list': items, 'has_more': 1, 'max_cursor': 123}).encode()
-            addon.LiveBypass().responseheaders(f)
+            addon.SelectiveDecrypt().responseheaders(f)
             assert f.response.stream is False
             addon.AdFilter().response(f)
             result = json.loads(encoding.decode(f.response.raw_content, f.response.headers['content-encoding']))
@@ -79,9 +88,26 @@ for enc in ('identity', 'gzip', 'br', 'zstd'):
             else:
                 assert int(f.response.headers['content-length']) == len(f.response.raw_content)
             passed += 1
+
+# 4. 非 200 / 空响应体 / HTML 响应不触发 parse fail
+logs.clear()
+for status, mime, body in [
+    (204, 'application/json', b''),
+    (200, 'application/json', b'   '),
+    (200, 'text/html', b'<html>blocked</html>'),
+    (302, 'application/json', b''),
+]:
+    f = flow('https://www.douyin.com/aweme/v1/web/tab/feed/', mime, status, body)
+    addon.AdFilter().response(f)
+    passed += 1
+assert not any('parse fail' in m for m in logs), logs
+
 print(f'PASS: {passed} offline checks', flush=True)
 
+# 5. 真实本机代理流式首段数据转发测试
 gates = {}
+
+
 class MediaServer(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         gate = gates[self.path]
@@ -98,6 +124,7 @@ class MediaServer(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
 
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), MediaServer)
 threading.Thread(target=server.serve_forever, daemon=True).start()
